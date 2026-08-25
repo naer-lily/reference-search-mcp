@@ -1,0 +1,8 @@
+node_modules/
+dist/
+out/
+data/
+*.log
+.env
+.env.local
+.pi/
