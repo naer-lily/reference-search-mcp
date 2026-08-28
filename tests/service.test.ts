@@ -6,7 +6,7 @@ import sharp from "sharp";
 import { loadConfig } from "../src/config.js";
 import { SessionManager } from "../src/session/manager.js";
 import { SearchService, UserError } from "../src/service.js";
-import { type Llm, type FilterGridInput, type FeedbackInput } from "../src/llm/pi.js";
+import { type Llm, type FilterGridInput, type FeedbackInput, type KeywordPlan } from "../src/llm/pi.js";
 import { type ProviderSearchOptions, type SearchProvider } from "../src/providers/base.js";
 import type { FeedbackPlan, FilterResult, ImageResult } from "../src/types.js";
 
@@ -44,8 +44,10 @@ async function result(n: number): Promise<ImageResult> {
 
 class FakeProvider implements SearchProvider {
   readonly name = "fake";
+  searchCalls: string[][] = [];
   constructor(private readonly items: ImageResult[]) {}
-  async search(_k: string[], _o: ProviderSearchOptions): Promise<ImageResult[]> {
+  async search(keywords: string[], _o: ProviderSearchOptions): Promise<ImageResult[]> {
+    this.searchCalls.push(keywords);
     return this.items;
   }
 }
@@ -55,12 +57,12 @@ class FakeLlm implements Llm {
   parseCalls = 0;
   filterCalls: FilterGridInput[] = [];
   constructor(
-    private readonly keywords: string[] = ["parsed-a", "parsed-b"],
+    private readonly plan: KeywordPlan = { terms: ["parsed-a", "parsed-b"] },
     private readonly filter: (input: FilterGridInput) => FilterResult = () => ({ selected: [], rejected: [], reasons: {} }),
   ) {}
-  async parseKeywords(_q: string, _c?: string): Promise<string[] | null> {
+  async parseKeywords(_q: string, _c?: string): Promise<KeywordPlan | null> {
     this.parseCalls++;
-    return this.keywords;
+    return this.plan;
   }
   async interpretFeedback(_i: FeedbackInput): Promise<FeedbackPlan | null> {
     return { addTerms: ["more-x"], removeTerms: [] };
@@ -152,7 +154,7 @@ describe("SearchService", () => {
 
   it("vision filter receives valid ids, grid image, and metadata table", async () => {
     let seen: FilterGridInput | undefined;
-    const llm = new FakeLlm(["k"], (input) => {
+    const llm = new FakeLlm({ terms: ["k"] }, (input) => {
       seen = input;
       return { selected: [input.validIds[0]!], rejected: [], reasons: { [input.validIds[0]!]: "best" } };
     });
@@ -192,5 +194,25 @@ describe("SearchService", () => {
     expect(llm.filterCalls).toHaveLength(0);
     expect(r.filtered).toBe(false);
     expect(r.selectedIds).toEqual(["a1", "a2"]);
+  });
+
+  it("multi-aspect keyword groups are searched in parallel and tagged in metadata", async () => {
+    const llm = new FakeLlm({
+      terms: ["M1911 pistol"],
+      groups: [
+        { label: "正面", terms: ["M1911 front view"] },
+        { label: "侧面", terms: ["M1911 side view"] },
+      ],
+    });
+    const provider = new FakeProvider([await result(1)]);
+    const { service } = setup(llm, provider);
+    const r = await service.start("M1911 各角度", {});
+    // one search per group (main terms not searched when groups exist)
+    expect(provider.searchCalls).toHaveLength(2);
+    expect(provider.searchCalls[0]).toEqual(["M1911 front view"]);
+    expect(provider.searchCalls[1]).toEqual(["M1911 side view"]);
+    // results tagged with group label
+    expect(r.metadata[0].group).toBe("正面");
+    expect(r.keywordsUsed).toEqual(["M1911 pistol"]);
   });
 });

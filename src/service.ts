@@ -1,5 +1,5 @@
 import type { Config } from "./config.js";
-import { type Llm } from "./llm/pi.js";
+import { LlmDeliveryError, type KeywordGroup, type KeywordPlan, type Llm } from "./llm/pi.js";
 import { SessionManager } from "./session/manager.js";
 import { searchAll, type SearchProvider } from "./providers/index.js";
 import { buildGrid, gridToJpegBase64, type GridCellImage } from "./grid/builder.js";
@@ -42,6 +42,8 @@ export interface MetadataRow {
   height?: number;
   provider: string;
   url: string;
+  /** Keyword-group label (multi-aspect searches). */
+  group?: string;
 }
 
 export interface RoundResult {
@@ -122,20 +124,28 @@ export class SearchService {
   async start(query: string, opts: StartOptions = {}): Promise<RoundResult> {
     if (!query || !query.trim()) throw new UserError("query must be a non-empty string");
     const keywords = (opts.keywords ?? []).map((k) => k.trim()).filter(Boolean);
+    let groups: KeywordGroup[] | undefined;
     if (keywords.length === 0) {
       if (!this.llm?.ready) {
         throw new UserError(
           "no LLM is configured (missing pi provider credentials) and no explicit keywords were given; pass keywords explicitly",
         );
       }
-      const parsed = await this.llm.parseKeywords(query, opts.criteria);
-      if (!parsed || parsed.length === 0) {
+      let plan: KeywordPlan | null = null;
+      try {
+        plan = await this.llm.parseKeywords(query, opts.criteria);
+      } catch (e) {
+        if (e instanceof LlmDeliveryError) throw new UserError(e.message);
+        throw e;
+      }
+      if (!plan || plan.terms.length === 0) {
         throw new UserError("LLM produced no usable keywords; pass keywords explicitly");
       }
-      keywords.push(...parsed);
+      keywords.push(...plan.terms);
+      groups = plan.groups;
     }
     const session = this.sessions.create(query, keywords, opts.criteria);
-    return this.runRound(session, keywords, 0, opts, this.shouldFilter(opts));
+    return this.runRound(session, keywords, 0, opts, this.shouldFilter(opts), groups);
   }
 
   async iterate(sessionId: string, feedback: string, opts: StartOptions = {}): Promise<RoundResult> {
@@ -151,13 +161,24 @@ export class SearchService {
       session.keywords = keywords;
       page = session.rounds.length; // next page of results
     } else if (this.llm?.ready) {
-      plan = await this.llm.interpretFeedback({
-        query: session.query,
-        criteria: session.criteria,
-        currentKeywords: session.keywords,
-        roundsSummary: summarizeRounds(session),
-        feedback,
-      });
+      try {
+        plan = await this.llm.interpretFeedback({
+          query: session.query,
+          criteria: session.criteria,
+          currentKeywords: session.keywords,
+          roundsSummary: summarizeRounds(session),
+          feedback,
+        });
+      } catch (e) {
+        if (e instanceof LlmDeliveryError) {
+          warnings.push(`${e.message}；改用当前关键词取下一页`);
+          keywords = session.keywords;
+          page = session.rounds.length;
+          plan = null;
+        } else {
+          throw e;
+        }
+      }
       if (!plan || (plan.addTerms.length === 0 && plan.removeTerms.length === 0 && !plan.criteria && !plan.morePages)) {
         warnings.push("LLM proposed no keyword changes; fetching the next page with current keywords");
         keywords = session.keywords;
@@ -283,18 +304,37 @@ export class SearchService {
     page: number,
     opts: StartOptions,
     filter: boolean,
+    groups?: KeywordGroup[],
   ): Promise<RoundResult> {
     const max = this.spec.columns * this.spec.rows;
     const warnings: string[] = [];
     const letter = this.sessions.nextLetter(session);
 
-    const { results, errors } = await searchAll(this.providers, keywords, {
-      count: Math.min(opts.count ?? max, max),
-      page,
-      safeSearch: opts.safeSearch ?? this.cfg.safeSearch,
-      timeoutMs: this.cfg.httpTimeoutMs,
-    });
-    warnings.push(...errors);
+    const safeSearch = opts.safeSearch ?? this.cfg.safeSearch;
+    const count = Math.min(opts.count ?? max, max);
+    let results: ImageResult[];
+    let errors: string[];
+    if (groups && groups.length > 0) {
+      // multi-aspect: search each group in parallel, merge, tag results with group label
+      const perGroup = Math.max(1, Math.ceil(count / groups.length));
+      const outcomes = await Promise.all(
+        groups.map(async (g) => {
+          const r = await searchAll(this.providers, g.terms, { count: perGroup, page, safeSearch, timeoutMs: this.cfg.httpTimeoutMs });
+          return { label: g.label, results: r.results, errors: r.errors };
+        }),
+      );
+      results = [];
+      errors = [];
+      for (const o of outcomes) {
+        results.push(...o.results.map((r) => ({ ...r, group: o.label })));
+        errors.push(...o.errors);
+      }
+    } else {
+      const r = await searchAll(this.providers, keywords, { count, page, safeSearch, timeoutMs: this.cfg.httpTimeoutMs });
+      results = r.results;
+      errors = r.errors;
+    }
+    warnings.push(...classifyProviderErrors(errors));
 
     const { cells, skipped } = await this.prepareCells(results, session, letter, max);
 
@@ -318,15 +358,24 @@ export class SearchService {
     if (filter && this.llm?.ready) {
       filtered = true;
       const img = await gridToJpegBase64(gridPath, 1536, 85);
-      const fr = await this.llm.filterGrid({
-        query: session.query,
-        criteria: session.criteria,
-        keywords,
-        roundLetter: letter,
-        validIds,
-        metadataTable,
-        image: img,
-      });
+      let fr = null;
+      try {
+        fr = await this.llm.filterGrid({
+          query: session.query,
+          criteria: session.criteria,
+          keywords,
+          roundLetter: letter,
+          validIds,
+          metadataTable,
+          image: img,
+        });
+      } catch (e) {
+        if (e instanceof LlmDeliveryError) {
+          warnings.push(`${e.message}；返回全部候选`);
+        } else {
+          throw e;
+        }
+      }
       if (fr) {
         selectedIds = fr.selected;
         rejectedIds = fr.rejected;
@@ -461,6 +510,7 @@ function toMetadataRow(id: string, r: ImageResult): MetadataRow {
     height: r.height,
     provider: r.provider,
     url: r.fullUrl,
+    group: r.group,
   };
 }
 
@@ -473,11 +523,30 @@ function buildMetadataTable(cells: (PreparedCell | null)[], letter: string): str
     }
     const r = c.result;
     rows.push(
-      `${encodeId(letter, i)} | ${sanitize(r.title, 60)} | ${r.sourceDomain} | ${r.license ?? "-"} | ` +
+      `${encodeId(letter, i)} | ${r.group ? `${r.group} | ` : ""}${sanitize(r.title, 60)} | ${r.sourceDomain} | ${r.license ?? "-"} | ` +
         `${r.width && r.height ? `${r.width}x${r.height}` : "-"}`,
     );
   });
   return rows.join("\n");
+}
+
+/**
+ * Turn raw provider errors into actionable warnings: network-level failures
+ * get a "check network / configure HTTPS_PROXY" hint; HTTP rejections get a
+ * "possible anti-bot / rate limit" hint.
+ */
+function classifyProviderErrors(errors: string[]): string[] {
+  const out: string[] = [];
+  for (const e of errors) {
+    out.push(e);
+    const providerTag = e.startsWith("[") ? e.slice(0, e.indexOf("]") + 1) : "";
+    if (/(fetch failed|timeout|ENOTFOUND|ECONNREFUSED|ECONNRESET|UND_ERR)/i.test(e)) {
+      out.push(`${providerTag} 网络不可达：请检查网络连接，或配置 HTTPS_PROXY 后重试`);
+    } else if (/HTTP (429|403|4\d\d|5\d\d)/.test(e)) {
+      out.push(`${providerTag} 请求被拒绝：可能被反爬/限流，请稍后重试或从 PROVIDERS 中暂时移除`);
+    }
+  }
+  return out;
 }
 
 function extFor(contentType: string, url: string): string {

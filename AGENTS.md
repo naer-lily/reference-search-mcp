@@ -38,17 +38,20 @@ tests/            vitest：离线单测（FakeLlm/FakeProvider/data: URL）+ 真
 
 ## 关键设计决策（改动前必读）
 
-1. **LLM 结果用工具调用交付，不用裸 JSON**：参数 schema 由 provider 强制；无效参数（如不存在的 ID）靠"执行器回执错误 → 模型下一轮自愈"。纯文本 JSON 只是 fallback（`parseJsonWithRepair` + typebox 校验）。新增任何 LLM 输出时遵循此原则。
+1. **LLM 结果一律工具调用交付，绝无文本 JSON fallback**：参数 schema 由 provider 强制；无效参数（如不存在的 ID）靠"执行器回执错误 → 模型下一轮自愈"。tool_choice 策略（实测 DeepSeek）：thinking 开启时**不能**强制 tool_choice（API 400 "Thinking mode does not support this tool_choice"）→ 用 auto + 未调用工具时**对话逼问**（runToolLoop 追加"你必须调用工具"消息）；thinking 关闭（PI_THINKING=off）时**强制指定函数**（openai-completions 传 `{type:"function",function:{name}}` + `samplingParams.reasoning_effort="none"`；anthropic 传 `{type:"tool",name}`）。模型始终未调用工具 → 抛 `LlmDeliveryError`，service 层转 warning 或 UserError。
 2. **双模式**：`FILTER_MODE=auto|server|client`，调用级可用 `filter` 参数覆盖。server=服务器视觉筛选（纯文本调用方）；client=调用方自己看拼图选 ID（省一次视觉调用）。`collect` 接受任意有效 ID——调用方可无视 `selectedIds` 自己挑。
-3. **ID 规则**：轮次字母 + 序号（`a1`、`b12`）。跨轮去重用**精确 aHash 匹配**（`session.seenHashes`，64bit 二进制串）。
-4. **迭代循环由调用方 AI 驱动**：服务器 LLM 只有 3 个有界函数（解析关键词 / 解读反馈 / 筛选拼图），不引入 agent 框架。
+3. **多组关键词**：`submit_keywords` 的 `groups:[{label,terms}]` 支持多角度需求（如 M1911 正面/侧面/正侧面），各组并行搜索、去重后拼一张图，metadata 带 `group` 标签。单组兼容。
+4. **ID 规则**：轮次字母 + 序号（`a1`、`b12`）。跨轮去重用**精确 aHash 匹配**（`session.seenHashes`，64bit 二进制串）。
+5. **迭代循环由调用方 AI 驱动**：服务器 LLM 只有 3 个有界函数（解析关键词 / 解读反馈 / 筛选拼图），不引入 agent 框架。
 
 ## pi-ai 集成要点（踩过的坑，别重踩）
 
 - `createModels()` 是空壳：必须用 `builtinModels()`（`@earendil-works/pi-ai/providers/all`）注册内置提供商。
-- 认证解析在 Models 层：用 `models.streamSimple(model, context, opts)`，**不要**直接调 `provider.streamSimple`（会报 "No API key"）。
+- 认证解析在 Models 层：用 `models.stream(model, context, opts)` / `streamSimple`，**不要**直接调 `provider.streamSimple`（会报 "No API key"）。
+- 强制 tool_choice 需要 `models.stream`（`ApiStreamOptions`）；`streamSimple` 的 toolChoice 只有 `"auto"|"none"`。
 - 自定义 OpenAI 兼容端点（`PI_CUSTOM_PROVIDER_*`）：动态导入 `@earendil-works/pi-ai/api/${api}` —— **不要加 .js 后缀**（导出映射已带扩展名，会变成 `.js.js`）。
 - pi 版本 pin 精确版本（当前 0.84.3）；升级前先看 CHANGELOG，目录里模型可能变化（如 deepseek-v4-flash-vision-exp 不在内置目录，需自定义端点）。
+- 图源抓取走 `src/net.ts` 的 `fetchBuffer`：支持 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`（undici ProxyAgent）；不要直接调全局 fetch（无代理）。
 
 ## 约定与禁忌
 
@@ -62,5 +65,6 @@ tests/            vitest：离线单测（FakeLlm/FakeProvider/data: URL）+ 真
 
 ## 本机验证状态（2026-08）
 
-- DeepSeek `deepseek-v4-flash`（文本）+ `deepseek-v4-flash-vision-exp`（视觉，自定义端点）已验证全链路：关键词解析、视觉筛选（select/reject/refine 工具）、collect 下载均工作。
-- 34 个测试全绿。
+- DeepSeek `deepseek-v4-flash`（文本）+ `deepseek-v4-flash-vision-exp`（视觉，自定义端点）已验证全链路：自然语言关键词解析（含多组关键词）、视觉筛选（select/reject/refine 工具 + 每图中文视觉描述）、collect 下载均工作。
+- 本机网络：bing 稳定；ddg/wikimedia 间歇性超时（环境问题，warnings 有提示）。
+- 41 个测试全绿。

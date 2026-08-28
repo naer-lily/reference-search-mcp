@@ -1,9 +1,38 @@
 /**
  * HTTP fetch helpers: bounded retries, timeouts, size limits, UA.
+ * Optional HTTP(S) proxy support via HTTPS_PROXY / HTTP_PROXY / NO_PROXY.
  */
+
+import { fetch as undiciFetch, ProxyAgent } from "undici";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+const proxyAgents = new Map<string, ProxyAgent>();
+
+/** Resolve a ProxyAgent for the target URL, honoring NO_PROXY. Undefined = direct. */
+export function proxyFor(url: string): ProxyAgent | undefined {
+  const proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
+  if (!proxy) return undefined;
+  const host = new URL(url).hostname.toLowerCase();
+  const noProxy = process.env.NO_PROXY ?? process.env.no_proxy;
+  if (noProxy) {
+    for (const p of noProxy.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+      if (p === "*") return undefined;
+      if (p.startsWith(".")) {
+        if (host.endsWith(p)) return undefined;
+      } else if (host === p || host.endsWith(`.${p}`)) {
+        return undefined;
+      }
+    }
+  }
+  let agent = proxyAgents.get(proxy);
+  if (!agent) {
+    agent = new ProxyAgent(proxy);
+    proxyAgents.set(proxy, agent);
+  }
+  return agent;
+}
 
 export class HttpError extends Error {
   constructor(
@@ -56,7 +85,13 @@ export async function fetchBuffer(url: string, opts: FetchOptions = {}): Promise
     const onAbort = () => controller.abort(opts.signal?.reason ?? new Error("aborted"));
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      const res = await fetch(url, { headers, redirect: "follow", signal: controller.signal });
+      const dispatcher = proxyFor(url);
+      const res = await undiciFetch(url, {
+        headers,
+        redirect: "follow",
+        signal: controller.signal,
+        ...(dispatcher ? { dispatcher } : {}),
+      });
       if (!res.ok) {
         const e = new HttpError(`HTTP ${res.status} for ${url}`, res.status);
         const retryable = res.status === 429 || res.status >= 500;

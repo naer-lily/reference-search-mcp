@@ -30,7 +30,12 @@
 - 传了无效 ID（如 `a99`）时执行器回执错误，模型**下一轮自行修正**；
 - 与 MCP 外层同构：外层是调用方 AI 通过工具用我们，内层是我们通过工具用模型。
 
-LLM 层基于 [pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-ai`，MIT）：统一多提供商 API（Anthropic / OpenAI / DeepSeek / Gemini / 通义 / Kimi / MiniMax…）、自动认证解析、内置模型目录、重试与 JSON 修复工具。**不引入重型 agent 框架**——服务器端 LLM 只是三个有界函数（解析关键词 / 解读反馈 / 筛选拼图），真正的迭代循环由调用方 AI 驱动。
+**绝无文本 JSON fallback**——工具调用是唯一交付通道。tool_choice 策略（实测 DeepSeek v4-flash）：
+
+- **thinking 开启**（默认，本任务建议开启）：DeepSeek 的 thinking 模式**拒绝**强制 tool_choice（实测 400 "Thinking mode does not support this tool_choice"），故用 `auto` + 模型未调用工具时**对话逼问**（追加"你必须调用工具"，≤LLM_MAX_TURNS 轮）；
+- **thinking 关闭**（`PI_THINKING=off`）：`tool_choice` **强制指定函数**（openai-completions 传 `{type:"function",function:{name}}` + `reasoning_effort:"none"`），100% 保证调用。
+
+LLM 层基于 [pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-ai`，MIT）：统一多提供商 API（Anthropic / OpenAI / DeepSeek / Gemini / 通义 / Kimi / MiniMax…）、自动认证解析、内置模型目录、重试工具。**不引入重型 agent 框架**——服务器端 LLM 只是三个有界函数（解析关键词 / 解读反馈 / 筛选拼图），真正的迭代循环由调用方 AI 驱动。
 
 ## 快速开始
 
@@ -56,9 +61,10 @@ npx @earendil-works/pi-coding-agent /login   # 或直接 pi /login
 模型选择（可选）：
 
 ```bash
-export PI_TEXT_MODEL=deepseek/deepseek-chat
+export PI_TEXT_MODEL=deepseek/deepseek-v4-flash
 export PI_VISION_MODEL=anthropic/claude-sonnet-4-5
-export PI_THINKING=off            # off|minimal|low|medium|high
+# 本任务建议开启思考，不要设 off；设 off 会切换为强制 tool_choice
+# export PI_THINKING=off|minimal|low|medium|high
 ```
 
 自定义 OpenAI 兼容端点（Qwen-VL / GLM-4V / Ollama 等）：
@@ -92,6 +98,7 @@ export PROVIDERS=ddg,bing,wikimedia          # 默认；并行查询
 export OPENVERSE_TOKEN=...                   # 启用 openverse（CC 图库）
 export SERPER_API_KEY=...                    # 启用 serper（Google 图搜）
 export SAFE_SEARCH=true
+export HTTPS_PROXY=http://127.0.0.1:7890      # 可选：部分图源被墙时走代理
 ```
 
 ### 3. 接入 MCP 客户端
@@ -145,9 +152,10 @@ Claude Code：
 | `SESSION_TTL_MINUTES` | 120 | 会话与临时拼图自动清理 |
 | `DATA_DIR` / `OUT_DIR` | 系统 temp / `./out` | 数据与收集产物目录 |
 | `HTTP_TIMEOUT_MS` | 15000 | 抓取超时 |
-| `LLM_MAX_TURNS` | 3 | 内层工具循环最大轮数 |
+| `LLM_MAX_TURNS` | 3 | 内层工具循环最大轮数（含逼问轮） |
 | `FILTER_MODE` | `auto` | `auto` \| `server` \| `client`（见"双模式"） |
-| `PI_TEXT_MODEL` / `PI_VISION_MODEL` / `PI_THINKING` | 自动挑选 | LLM 模型选择 |
+| `PI_TEXT_MODEL` / `PI_VISION_MODEL` / `PI_THINKING` | 自动挑选 | LLM 模型选择；**建议开启思考，不要设 off**（设 off 切换为强制 tool_choice） |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | — | 图源抓取代理（部分图源被墙时配置） |
 
 ## 架构
 
@@ -165,16 +173,18 @@ src/
 ## 测试与脚本
 
 ```bash
-npm test                              # 34 个测试：单测 + 真实 MCP stdio 集成测试
+npm test                              # 41 个测试：单测 + 真实 MCP stdio 集成测试
 npm run smoke -- --query "space nebula" --keywords "nebula,art" --collect "a1,a2" [--iterate "更多星球"]
 npm run handshake -- --query "cat" --keywords "cat"     # MCP stdio 握手冒烟（先 build）
-npx tsx scripts/debug-pi.ts           # 诊断：pi 层工具调用（DeepSeek 文本）
+npx tsx scripts/debug-pi.ts           # 诊断：真实 parseKeywords（工具调用 + 多组关键词）
 npx tsx scripts/debug-vision.ts       # 诊断：视觉模型对最近一轮拼图的原始响应
 ```
 
 ## 注意事项
 
+- **多角度查询**：自然语言需求含多个方面时（如"M1911 各角度"），关键词解析产出**分组关键词**（正面/侧面/正侧面…），各组并行搜索、去重后拼成**一张图**，metadata 每行带 `group` 标签。
+- **每图描述**：视觉筛选时 `select_images` 的 note 填每张选中图的简短视觉描述（中文，面向绘画参考：角度/构图/光照/风格），随 `reasons` 字段交付——纯文本调用方也能"看到"图。
 - **版权**：`metadata`/`manifest` 透传 license（Wikimedia/Openverse 自带），商用素材请自行核验来源授权。
-- **热链保护**：部分站点（如 Etsy）拒绝第三方下载，collect 会逐 ID 报告失败；403 时可用浏览器直接打开 URL。
-- **反爬**：适配器带 UA、请求间隔与重试退避；单源失败不影响整体。
+- **热链保护**：部分站点（如 people.com.cn/Etsy）拒绝第三方下载，collect 会逐 ID 报告失败；403 时可用浏览器直接打开 URL。
+- **图源网络问题**：ddg/wikimedia 在部分网络环境（如中国大陆）不可达或间歇超时——warnings 会提示"网络不可达：配置 HTTPS_PROXY 后重试"；bing 通常稳定。
 - **降级模式**：无 LLM 凭据时需显式传 `keywords`，且不自动筛选（返回全部候选）。

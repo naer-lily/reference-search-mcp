@@ -18,6 +18,8 @@ export interface ImageResult {
   license?: string;
   width?: number;
   height?: number;
+  /** Keyword-group label this result belongs to (multi-aspect searches). */
+  group?: string;
 }
 
 /** A grid cell: either a candidate or null (unavailable / empty slot). */

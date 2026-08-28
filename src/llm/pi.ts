@@ -1,13 +1,21 @@
 /**
  * LLM layer on top of @earendil-works/pi-ai.
  *
- * Results are delivered via TOOL CALLS, not raw JSON text:
+ * Results are delivered EXCLUSIVELY via TOOL CALLS — never raw JSON text:
  * - the provider enforces the tool schema, so arguments arrive as valid JSON;
  * - invalid arguments are corrected by the model after an error tool result;
  * - multi-intent (select + reject + refine) happens in a single turn.
- * A bounded loop (maxTurns) drives tool execution with result receipts.
- * If the model does not call tools, plain-text JSON is parsed as a fallback
- * (parseJsonWithRepair + typebox validation).
+ *
+ * Tool-choice strategy (measured against DeepSeek v4-flash, 2026-08):
+ * - thinking ON (default): the API rejects forced tool_choice ("Thinking mode
+ *   does not support this tool_choice"), so we use toolChoice "auto" and, when
+ *   the model answers with text instead of calling a tool, we nudge it with a
+ *   follow-up user message ("you must call the tool") up to maxTurns.
+ * - thinking OFF (PI_THINKING=off): tool_choice is forced to the target
+ *   function (openai-completions: {type:"function",function:{name}}, plus
+ *   reasoning_effort "none" via samplingParams for DeepSeek).
+ * There is NO text-JSON fallback anywhere: if the model never calls a tool,
+ * the call fails with LlmDeliveryError.
  */
 
 import {
@@ -15,7 +23,6 @@ import {
   envApiKeyAuth,
   lazyApi,
   retryAssistantCall,
-  parseJsonWithRepair,
   type Api,
   type AssistantMessage,
   type Context,
@@ -30,12 +37,14 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { Type, type Static, type TSchema } from "typebox";
-import { Value } from "typebox/value";
+import { Type, type Static } from "typebox";
 import type { Config } from "../config.js";
 import type { FeedbackPlan, FilterResult } from "../types.js";
 
 export type ThinkingSetting = Config["piThinking"];
+
+/** The model answered without calling any tool after the loop exhausted its turns. */
+export class LlmDeliveryError extends Error {}
 
 const RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 1000 };
 
@@ -62,10 +71,22 @@ export interface ToolLoopOutcome {
   finalText: string;
 }
 
+/** One keyword group, e.g. { label: "侧面", terms: ["M1911 side view", ...] }. */
+export interface KeywordGroup {
+  label: string;
+  terms: string[];
+}
+
+/** Result of keyword parsing: main terms plus optional per-aspect groups. */
+export interface KeywordPlan {
+  terms: string[];
+  groups?: KeywordGroup[];
+}
+
 /** Minimal interface so the service can run with a stub LLM in tests. */
 export interface Llm {
   readonly ready: boolean;
-  parseKeywords(query: string, criteria?: string): Promise<string[] | null>;
+  parseKeywords(query: string, criteria?: string): Promise<KeywordPlan | null>;
   interpretFeedback(input: FeedbackInput): Promise<FeedbackPlan | null>;
   filterGrid(input: FilterGridInput): Promise<FilterResult | null>;
 }
@@ -93,11 +114,25 @@ export interface FilterGridInput {
 
 // ---------- tool schemas (typebox) ----------
 
+const keywordGroupParams = Type.Object(
+  {
+    label: Type.String({ description: "short aspect label, e.g. 正面 / side view" }),
+    terms: Type.Array(Type.String({ description: "search terms for this aspect" }), { minItems: 1 }),
+  },
+  { additionalProperties: false },
+);
+
 const submitKeywordsParams = Type.Object(
   {
     terms: Type.Array(Type.String({ description: "search terms; mix languages and synonyms" }), { minItems: 1 }),
     negative_terms: Type.Optional(Type.Array(Type.String())),
     criteria: Type.Optional(Type.String({ description: "style / quality criteria for the curator" })),
+    groups: Type.Optional(
+      Type.Array(keywordGroupParams, {
+        description:
+          "optional per-aspect keyword groups (e.g. front/side/rear views) when the request asks for multiple aspects; each group is searched in parallel",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -106,7 +141,12 @@ type SubmitKeywordsArgs = Static<typeof submitKeywordsParams>;
 const selectParams = Type.Object(
   {
     ids: Type.Array(Type.String({ description: "valid cell ids, e.g. a3" })),
-    note: Type.Optional(Type.String()),
+    note: Type.Optional(
+      Type.String({
+        description:
+          "one-sentence Chinese visual description of THIS selection, for art reference: angle / composition / lighting / style. Only describe the images in ids, one description per image.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -129,12 +169,14 @@ type RefineArgs = Static<typeof refineParams>;
 
 const SUBMIT_KEYWORDS_TOOL: Tool = {
   name: "submit_keywords",
-  description: "Submit the final keyword set for the image search.",
+  description:
+    "Submit the final keyword set for the image search. If the request asks for multiple aspects " +
+    "(e.g. all angles of an object), also provide one group per aspect via the groups field.",
   parameters: submitKeywordsParams,
 };
 const SELECT_TOOL: Tool = {
   name: "select_images",
-  description: "Mark grid cells to keep. Only valid cell ids may be used.",
+  description: "Mark grid cells to keep. Only valid cell ids may be used. Fill note with a one-sentence visual description of each kept image.",
   parameters: selectParams,
 };
 const REJECT_TOOL: Tool = {
@@ -239,27 +281,41 @@ export class PiLlm implements Llm {
 
   // ---------- public API ----------
 
-  async parseKeywords(query: string, criteria?: string): Promise<string[] | null> {
+  async parseKeywords(query: string, criteria?: string): Promise<KeywordPlan | null> {
     if (!this.textModel) return null;
     const system =
       "You plan search keywords for an image search engine. Given a natural-language request, " +
       "produce a compact keyword set (mix languages and synonyms, include style words like " +
-      '"photo", "illustration", "3d render", "flat design"). Call submit_keywords exactly once with the final set.';
+      '"photo", "illustration", "3d render", "flat design"). ' +
+      'If the request asks for multiple aspects of a subject (e.g. "all angles of a pistol": ' +
+      "front, side, three-quarter, rear, top, bottom), also provide one group per aspect via the groups field. " +
+      "Call submit_keywords exactly once with the final set; do not answer with text.";
     const user = `Request: ${query}${criteria ? `\nStyle/quality criteria: ${criteria}` : ""}`;
     const outcome = await this.runToolLoop(this.textModel, system, user, [SUBMIT_KEYWORDS_TOOL], async (call) => {
       const args = call.arguments as SubmitKeywordsArgs;
       const terms = asStrings(args.terms).map((s) => s.trim()).filter(Boolean);
       if (terms.length === 0) return { content: "terms must contain at least one non-empty search term", isError: true };
-      return { content: `accepted ${terms.length} terms` };
+      return { content: `accepted ${terms.length} terms${Array.isArray(args.groups) ? ` + ${args.groups.length} groups` : ""}` };
     });
     const call = outcome.calls.find((c) => c.name === "submit_keywords");
-    if (call) {
-      const args = call.args as SubmitKeywordsArgs;
-      const terms = asStrings(args.terms).map((s) => s.trim()).filter(Boolean);
-      if (terms.length > 0) return dedupe(terms);
+    if (!call) {
+      throw new LlmDeliveryError(
+        `模型未调用 submit_keywords 工具（模型用文本回答了，工具调用是唯一交付通道）。` +
+          `请检查模型是否支持工具调用；也可设 PI_THINKING=off 切换为强制工具调用模式。`,
+      );
     }
-    // fallback: parse plain-text JSON
-    return this.fallbackJson<string[]>(outcome.finalText, Type.Array(Type.String({ minLength: 1 })));
+    const args = call.args as SubmitKeywordsArgs;
+    const terms = asStrings(args.terms).map((s) => s.trim()).filter(Boolean);
+    if (terms.length === 0) {
+      throw new LlmDeliveryError("模型调用了 submit_keywords 但未提供有效关键词");
+    }
+    const groups = (Array.isArray(args.groups) ? args.groups : [])
+      .map((g) => ({
+        label: typeof g?.label === "string" ? g.label.trim() : "",
+        terms: asStrings(g?.terms).map((s) => s.trim()).filter(Boolean),
+      }))
+      .filter((g) => g.label && g.terms.length > 0);
+    return { terms: dedupe(terms), groups: groups.length > 0 ? groups : undefined };
   }
 
   async interpretFeedback(input: FeedbackInput): Promise<FeedbackPlan | null> {
@@ -267,7 +323,8 @@ export class PiLlm implements Llm {
     const system =
       "You refine an ongoing image search. The user gives feedback referencing round ids " +
       '(like "a3" or "b12") and style preferences. Call refine_search with keyword adjustments. ' +
-      "Terms that describe unwanted content go to remove_terms; new directions go to add_terms.";
+      "Terms that describe unwanted content go to remove_terms; new directions go to add_terms. " +
+      "Do not answer with text.";
     const user =
       `Query: ${input.query}\n` +
       `Current keywords: ${input.currentKeywords.join(", ")}\n` +
@@ -278,27 +335,13 @@ export class PiLlm implements Llm {
       content: "recorded",
     }));
     const call = outcome.calls.find((c) => c.name === "refine_search");
-    if (call) return this.toFeedbackPlan(call.args as RefineArgs);
-    return this.fallbackJson<FeedbackPlan>(
-      outcome.finalText,
-      Type.Object(
-        {
-          addTerms: Type.Array(Type.String()),
-          removeTerms: Type.Array(Type.String()),
-          criteria: Type.Optional(Type.String()),
-          morePages: Type.Optional(Type.Integer()),
-        },
-        { additionalProperties: false },
-      ),
-      {
-        map: (v) => ({
-          addTerms: asStrings((v as Record<string, unknown>).addTerms),
-          removeTerms: asStrings((v as Record<string, unknown>).removeTerms),
-          criteria: typeof (v as Record<string, unknown>).criteria === "string" ? ((v as Record<string, unknown>).criteria as string) : undefined,
-          morePages: typeof (v as Record<string, unknown>).morePages === "number" ? ((v as Record<string, unknown>).morePages as number) : undefined,
-        }),
-      },
-    );
+    if (!call) {
+      throw new LlmDeliveryError(
+        `模型未调用 refine_search 工具（模型用文本回答了，工具调用是唯一交付通道）。` +
+          `请检查模型是否支持工具调用；也可设 PI_THINKING=off 切换为强制工具调用模式。`,
+      );
+    }
+    return this.toFeedbackPlan(call.args as RefineArgs);
   }
 
   async filterGrid(input: FilterGridInput): Promise<FilterResult | null> {
@@ -309,10 +352,11 @@ export class PiLlm implements Llm {
       `(round ${input.roundLetter.toUpperCase()}, cells ${input.validIds[0]}..${input.validIds.at(-1)}) plus a metadata table. ` +
       "Pick the images that best match the query and criteria: relevant, high quality, style-consistent, " +
       "no watermarks or text overlays when avoidable. Use the tools:\n" +
-      "- select_images: keep these cells.\n" +
+      "- select_images: keep these cells. Fill note with one-sentence Chinese visual descriptions of the kept " +
+      "images, one per image in the same order as ids (angle / composition / lighting / style), for art reference.\n" +
       "- reject_images: mark clearly irrelevant cells (optional).\n" +
       "- refine_search: propose next-round keyword changes (optional).\n" +
-      "Only valid cell ids may be used. You may call tools several times.";
+      "Only valid cell ids may be used. You may call tools several times; do not answer with text.";
     const userContent: (TextContent | ImageContent)[] = [
       {
         type: "text",
@@ -320,7 +364,7 @@ export class PiLlm implements Llm {
           `Query: ${input.query}\n` +
           (input.criteria ? `Criteria: ${input.criteria}\n` : "") +
           `Keywords: ${input.keywords.join(", ")}\n` +
-          `Metadata table (id | title | source | license | size):\n${input.metadataTable}`,
+          `Metadata table (id | group | title | source | license | size):\n${input.metadataTable}`,
       },
       { type: "image", data: input.image.data, mimeType: input.image.mimeType },
     ];
@@ -346,7 +390,7 @@ export class PiLlm implements Llm {
           }
           for (const id of ids) {
             if (!selected.includes(id)) selected.push(id);
-            const n = typeof args.note === "string" ? args.note : "";
+            const n = typeof args.note === "string" ? args.note.trim() : "";
             if (n) reasons[id] = n;
           }
           return { content: `recorded ${ids.length} selections` };
@@ -369,37 +413,15 @@ export class PiLlm implements Llm {
       }
     });
 
-    const cleanedSelected = selected.filter((id) => !rejected.includes(id));
-    if (outcome.finalText.trim()) note = outcome.finalText.trim().slice(0, 500);
-
-    // fallback: no tool calls — parse plain-text JSON
     if (outcome.calls.length === 0) {
-      const parsed = this.fallbackJson<{ selected?: unknown; rejected?: unknown; reasons?: unknown; refine?: unknown; note?: string }>(
-        outcome.finalText,
-        Type.Object(
-          {
-            selected: Type.Optional(Type.Array(Type.String())),
-            rejected: Type.Optional(Type.Array(Type.String())),
-            reasons: Type.Optional(Type.Record(Type.String(), Type.String())),
-            refine: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-            note: Type.Optional(Type.String()),
-          },
-          { additionalProperties: false },
-        ),
+      throw new LlmDeliveryError(
+        `模型未调用任何工具（select_images / reject_images / refine_search）——工具调用是唯一交付通道。` +
+          `请检查模型是否支持工具调用；也可设 PI_THINKING=off 切换为强制工具调用模式。`,
       );
-      if (parsed) {
-        const sel = asStrings(parsed.selected).filter((id) => valid.has(id));
-        const rej = asStrings(parsed.rejected).filter((id) => valid.has(id));
-        return {
-          selected: sel.filter((id) => !rej.includes(id)),
-          rejected: rej,
-          reasons: parsed.reasons && typeof parsed.reasons === "object" ? (parsed.reasons as Record<string, string>) : {},
-          refine: parsed.refine ? this.toFeedbackPlan(parsed.refine as RefineArgs) : undefined,
-          note: parsed.note ?? note,
-        };
-      }
     }
 
+    const cleanedSelected = selected.filter((id) => !rejected.includes(id));
+    if (outcome.finalText.trim()) note = outcome.finalText.trim().slice(0, 500);
     return { selected: cleanedSelected, rejected, reasons, refine, note };
   }
 
@@ -414,63 +436,86 @@ export class PiLlm implements Llm {
     };
   }
 
-  /** Bounded tool loop. Returns after the model stops (no toolUse) or maxTurns. */
+  /**
+   * Bounded tool loop. When the model answers with text instead of calling a
+   * tool (stopReason "stop"), a follow-up user message demands a tool call and
+   * the loop continues. When thinking is OFF, call() forces tool_choice, so
+   * text answers should not happen at all. No text parsing anywhere.
+   */
   private async runToolLoop(
     model: Model<Api>,
     system: string,
     userContent: string | (TextContent | ImageContent)[],
     tools: Tool[],
     execute: (call: ToolCall) => Promise<{ content: string; isError?: boolean }>,
+    forceTool?: string | "required",
   ): Promise<ToolLoopOutcome> {
     const messages: Message[] = [{ role: "user", content: userContent, timestamp: Date.now() }];
     const calls: ToolExecution[] = [];
     let last: AssistantMessage | undefined;
     for (let turn = 0; turn < this.maxTurns; turn++) {
-      last = await this.call(model, system, messages, tools);
+      last = await this.call(model, system, messages, tools, forceTool);
       messages.push(last);
       const toolCalls = last.content.filter(isToolCall);
       calls.push(...toolCalls.map((c) => ({ name: c.name, args: c.arguments })));
-      if (last.stopReason !== "toolUse" || toolCalls.length === 0) break;
-      for (const call of toolCalls) {
-        const r = await execute(call);
+      if (toolCalls.length > 0) {
+        for (const call of toolCalls) {
+          const r = await execute(call);
+          messages.push({
+            role: "toolResult",
+            toolCallId: call.id,
+            toolName: call.name,
+            content: [{ type: "text", text: r.content }],
+            isError: r.isError ?? false,
+            timestamp: Date.now(),
+          });
+        }
+        continue;
+      }
+      // no tool calls this turn
+      if (last.stopReason !== "stop") break; // error/aborted/length: nudging is pointless
+      if (turn < this.maxTurns - 1) {
         messages.push({
-          role: "toolResult",
-          toolCallId: call.id,
-          toolName: call.name,
-          content: [{ type: "text", text: r.content }],
-          isError: r.isError ?? false,
+          role: "user",
+          content: `你还没有调用任何工具。你必须调用 ${tools.map((t) => t.name).join(" 或 ")} 完成本任务，禁止用文本回答。`,
           timestamp: Date.now(),
         });
+        continue;
       }
+      break;
     }
     return { message: last!, calls, finalText: last ? textOf(last) : "" };
   }
 
-  private async call(model: Model<Api>, system: string, messages: Message[], tools: Tool[]): Promise<AssistantMessage> {
+  private async call(
+    model: Model<Api>,
+    system: string,
+    messages: Message[],
+    tools: Tool[],
+    forceTool?: string | "required",
+  ): Promise<AssistantMessage> {
     const context: Context = { systemPrompt: system, messages, tools };
-    const options: { reasoning?: ThinkingLevel; temperature?: number } = {};
-    if (this.thinking) options.reasoning = this.thinking;
-    // Models.streamSimple resolves provider auth (env vars / credential store)
-    // and dispatches to the provider adapter.
-    const produce = () => this.models.streamSimple(model, context, options).result();
-    return retryAssistantCall(produce, RETRY_POLICY, undefined);
-  }
-
-  private fallbackJson<T>(
-    text: string,
-    schema: TSchema,
-    opts?: { map?: (v: unknown) => T },
-  ): T | null {
-    const trimmed = text.trim();
-    if (!trimmed) return null;
-    let parsed: unknown;
-    try {
-      parsed = parseJsonWithRepair<T>(trimmed);
-    } catch {
-      return null;
+    const options: Record<string, unknown> = {};
+    if (this.thinking) {
+      options.reasoning = this.thinking;
+      // thinking ON: forced tool_choice is rejected by DeepSeek ("Thinking mode
+      // does not support this tool_choice") — runToolLoop nudges text answers instead.
+    } else if (forceTool) {
+      // thinking OFF: force the tool call.
+      if (model.api === "openai-completions") {
+        options.toolChoice =
+          forceTool === "required" ? "required" : { type: "function", function: { name: forceTool } };
+        // DeepSeek: required tool_choice is also rejected while thinking; turn it off explicitly.
+        options.samplingParams = { reasoning_effort: "none" };
+      } else if (model.api === "anthropic-messages") {
+        options.toolChoice = forceTool === "required" ? "any" : { type: "tool", name: forceTool };
+      } else {
+        options.toolChoice = "required";
+      }
     }
-    if (!Value.Check(schema, parsed)) return null;
-    return opts?.map ? opts.map(parsed) : (parsed as T);
+    // Models.stream resolves provider auth and dispatches to the provider adapter.
+    const produce = () => this.models.stream(model, context, options as never).result();
+    return retryAssistantCall(produce, RETRY_POLICY, undefined);
   }
 }
 

@@ -10,6 +10,13 @@ describe("ddg", () => {
     expect(extractVqd(`<html>no token</html>`)).toBeNull();
   });
 
+  it("extracts vqd from real-page-shaped html (script var + hidden input)", () => {
+    const html =
+      `<html><head><script>const vqd='3-1234567890123456789012345678901234567890';</script></head>` +
+      `<body><form><input type="hidden" name="vqd" value="4-abcdef-9876543210"></form></body></html>`;
+    expect(extractVqd(html)).toBe("3-1234567890123456789012345678901234567890");
+  });
+
   it("maps i.js results", () => {
     const out = parseDdgJson(
       {
